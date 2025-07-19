@@ -1,0 +1,8 @@
+opencv-python
+onnx
+onnxruntime-gpu
+empy==3.3.4
+setuptools
+numpy<2.0
+empy==3.3.4
+setuptools

@@ -59,10 +59,13 @@ class VideoPublisherNode(Node):
             # self.get_logger().info('正在发布视频帧...') # 取消此行注释可以查看详细日志，但会刷屏
         else:
             # 如果视频播放完毕 (ret is False)
-            self.get_logger().info('视频播放结束，节点将关闭。')
-            self.cap.release() # 释放视频捕获对象
-            self.destroy_node() # 销毁节点
-            rclpy.shutdown() # 关闭rclpy
+            self.get_logger().info('视频播放结束，正在循环播放...')
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+
+            # self.get_logger().info('视频播放结束，节点将关闭。')
+            # self.cap.release() # 释放视频捕获对象
+            # self.destroy_node() # 销毁节点
+            # rclpy.shutdown() # 关闭rclpy
 
 def main(args=None):
     rclpy.init(args=args)

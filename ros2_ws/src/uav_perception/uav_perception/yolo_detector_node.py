@@ -9,7 +9,7 @@ import onnxruntime as ort # 导入ONNX Runtime
 import os
 
 # 导入我们自定义的消息类型
-from uav_perception.msg import Detection, Detections
+from uav_interfaces.msg import Detection, Detections
 
 # YOLOv12 COCO 数据集类别名称 (80类)
 COCO_CLASSES = ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
