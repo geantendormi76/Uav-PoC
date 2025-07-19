@@ -1,5 +1,3 @@
-# 创建一个基础的README文件
-cat << 'EOF' > README.md
 # Project Chimera - 数字孪生无人机感知模块
 
 ## 愿景
