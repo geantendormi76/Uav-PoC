@@ -1,0 +1,47 @@
+# 使用cat和重定向操作，快速创建并写入.gitignore文件
+cat << 'EOF' > .gitignore
+# JetBrains IDEs
+.idea/
+
+# VS Code
+.vscode/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+.env
+.venv
+.direnv/ # 忽略direnv的本地环境
+
+# ROS / Colcon
+install/
+log/
+# build/ 已经包含在Python部分
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+EOF
