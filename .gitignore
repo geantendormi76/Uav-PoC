@@ -13,6 +13,7 @@ __pycache__/
 build/
 install/
 log/
+sim_scripts/
 
 # Simulation scripts (as requested)
 sim_scripts/
