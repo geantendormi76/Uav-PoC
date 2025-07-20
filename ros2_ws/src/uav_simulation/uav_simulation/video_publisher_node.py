@@ -5,6 +5,7 @@ from sensor_msgs.msg import Image
 import cv2
 from cv_bridge import CvBridge
 import os
+from std_msgs.msg import Header
 
 class VideoPublisherNode(Node):
     """
@@ -52,7 +53,12 @@ class VideoPublisherNode(Node):
         if ret:
             # 如果成功读取到一帧 (ret is True)
             # 使用cv_bridge将OpenCV图像(BGR格式)转换为ROS Image消息
-            image_message = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
+            header = Header()
+            header.stamp = self.get_clock().now().to_msg() # 使用当前ROS时间
+            header.frame_id = 'uav_camera_link'           # 给坐标系一个有意义的名字
+
+            # 使用cv_bridge将OpenCV图像(BGR格式)转换为ROS Image消息，并附上header
+            image_message = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8", header=header)
             
             # 发布图像消息
             self.publisher_.publish(image_message)

@@ -29,7 +29,7 @@ class YoloDetectorNode(Node):
         # --- 参数定义 ---
         default_model_path = '/mnt/c/Users/zhz/uav/assets/models/yolov12m.onnx'
         self.declare_parameter('model_path', default_model_path)
-        self.declare_parameter('confidence_threshold', 0.5) # 置信度阈值
+        self.declare_parameter('confidence_threshold', 0.25) # 置信度阈值
         self.declare_parameter('iou_threshold', 0.4)      # IoU阈值 (用于NMS)
         
         # --- 加载ONNX模型 ---
@@ -81,38 +81,71 @@ class YoloDetectorNode(Node):
         return padded_img, scale
 
     def postprocess(self, outputs, original_shape, scale):
-        """对模型输出进行后处理"""
-        # YOLOv12的输出通常是 [batch, 84, num_proposals] 或类似形状
-        # 84 = 4 (bbox) + 80 (classes)
+        """对模型输出进行后处理 (v3 - 诊断版)"""
+        # --- 日志1: 检查原始模型输出 ---
+        self.get_logger().info(f"--- Frame Analysis Start ---")
+        self.get_logger().info(f"Model raw output shape: {outputs[0].shape}")
+
         predictions = np.squeeze(outputs[0]).T
 
         scores = np.max(predictions[:, 4:], axis=1)
-        predictions = predictions[scores > self.get_parameter('confidence_threshold').get_parameter_value().double_value, :]
-        scores = scores[scores > self.get_parameter('confidence_threshold').get_parameter_value().double_value]
+        conf_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
+        
+        # --- 日志2: 检查置信度过滤前的检测数量 ---
+        self.get_logger().info(f"Total proposals before confidence filtering: {len(scores)}")
+
+        # 过滤掉低于置信度阈值的预测
+        high_conf_indices = scores > conf_threshold
+        predictions = predictions[high_conf_indices, :]
+        scores = scores[high_conf_indices]
+
+        # --- 日志3: 检查置信度过滤后的检测数量 ---
+        self.get_logger().info(f"Proposals after confidence filtering (threshold={conf_threshold:.2f}): {len(scores)}")
 
         if predictions.shape[0] == 0:
+            self.get_logger().warn("No proposals left after confidence filtering. Nothing to process.")
             return [], [], []
 
         class_ids = np.argmax(predictions[:, 4:], axis=1)
-        boxes = predictions[:, :4]
+        boxes_cxcywh = predictions[:, :4]
 
-        # 将坐标从模型输入尺寸转换回原始图像尺寸
-        # 1. 减去padding
-        boxes[:, 0] -= ((self.input_width - original_shape[1] * scale) / 2)
-        boxes[:, 1] -= ((self.input_height - original_shape[0] * scale) / 2)
-        # 2. 除以缩放比例
-        boxes /= scale
+        boxes_xywh = boxes_cxcywh.copy()
+        boxes_xywh[:, 0] = boxes_cxcywh[:, 0] - (boxes_cxcywh[:, 2] / 2)
+        boxes_xywh[:, 1] = boxes_cxcywh[:, 1] - (boxes_cxcywh[:, 3] / 2)
+        
+        iou_threshold = self.get_parameter('iou_threshold').get_parameter_value().double_value
+        
+        # --- 日志4: 检查送入NMS的数据 ---
+        self.get_logger().info(f"Data sent to NMS: {len(boxes_xywh)} boxes, {len(scores)} scores.")
 
-        # 执行非极大值抑制(NMS)
-        indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(), 
-                                   self.get_parameter('confidence_threshold').get_parameter_value().double_value,
-                                   self.get_parameter('iou_threshold').get_parameter_value().double_value)
+        indices = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), scores.tolist(), conf_threshold, iou_threshold)
+        
+        # --- 日志5: 检查NMS的输出结果 ---
+        self.get_logger().info(f"NMS raw output: {indices}")
 
-        final_boxes = boxes[indices]
+        if len(indices) > 0:
+            indices = indices.flatten()
+            self.get_logger().info(f"NMS result: {len(indices)} boxes left after suppression.")
+        else:
+            self.get_logger().warn("NMS suppressed all boxes. No detections to publish.")
+            return [], [], []
+
+        final_boxes_cxcywh = boxes_cxcywh[indices]
         final_scores = scores[indices]
         final_class_ids = class_ids[indices]
         
-        return final_boxes, final_scores, final_class_ids
+        # --- 日志6: 打印最终检测结果 ---
+        final_class_names = [COCO_CLASSES[i] for i in final_class_ids]
+        self.get_logger().info(f"Final Detections: {list(zip(final_class_names, final_scores))}")
+        self.get_logger().info(f"--- Frame Analysis End ---")
+
+
+        # 将坐标从模型输入尺寸转换回原始图像尺寸 (这部分代码保持不变)
+        final_boxes_cxcywh[:, 0] -= ((self.input_width - original_shape[1] * scale) / 2)
+        final_boxes_cxcywh[:, 1] -= ((self.input_height - original_shape[0] * scale) / 2)
+        final_boxes_cxcywh /= scale
+        
+        return final_boxes_cxcywh, final_scores, final_class_ids
 
 
     def image_callback(self, msg: Image):
@@ -129,16 +162,20 @@ class YoloDetectorNode(Node):
 
         # 封装成自定义消息
         detections_msg = Detections()
+        # --- 关键修正：将接收到的图像消息头传递下去 ---
         detections_msg.header = msg.header
 
         for box, score, class_id in zip(boxes, scores, class_ids):
             detection = Detection()
             detection.class_name = COCO_CLASSES[class_id]
             detection.confidence = float(score)
-            # 将xywh格式的box转换为xyxy格式并转为整数
-            x, y, w, h = box
-            x1, y1 = int(x - w / 2), int(y - h / 2)
-            x2, y2 = int(x + w / 2), int(y + h / 2)
+            
+            cx, cy, w, h = box
+            x1 = int(cx - w / 2)
+            y1 = int(cy - h / 2)
+            x2 = int(cx + w / 2)
+            y2 = int(cy + h / 2)
+            
             detection.bbox = [x1, y1, x2, y2]
             detections_msg.detections.append(detection)
             
