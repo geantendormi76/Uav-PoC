@@ -5,7 +5,7 @@ from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 import cv2
 import numpy as np
-import onnxruntime as ort # 导入ONNX Runtime
+import onnxruntime as ort
 import os
 
 # 导入我们自定义的消息类型
@@ -29,26 +29,31 @@ class YoloDetectorNode(Node):
         # --- 参数定义 ---
         default_model_path = '/mnt/c/Users/zhz/uav/assets/models/yolov12m.onnx'
         self.declare_parameter('model_path', default_model_path)
-        self.declare_parameter('confidence_threshold', 0.25) # 置信度阈值
-        self.declare_parameter('iou_threshold', 0.4)      # IoU阈值 (用于NMS)
+        # --- 将默认置信度恢复为项目初始设定的0.25，但我们知道可以随时调整 ---
+        self.declare_parameter('confidence_threshold', 0.25)
+        self.declare_parameter('iou_threshold', 0.45)
         
         # --- 加载ONNX模型 ---
         model_path = self.get_parameter('model_path').get_parameter_value().string_value
+        self.input_width = 640
+        self.input_height = 640
+        
         self.get_logger().info(f"正在从本地路径加载ONNX模型: {model_path}...")
         
         if not os.path.exists(model_path):
             self.get_logger().error(f"模型文件未找到: {model_path}")
             raise FileNotFoundError(f"模型文件未找到: {model_path}")
         
-        # 使用ONNX Runtime创建推理会话，并指定使用CUDA
-        self.session = ort.InferenceSession(model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-        self.get_logger().info("ONNX模型加载成功，使用CUDA进行推理。")
+        try:
+            self.session = ort.InferenceSession(model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+            self.get_logger().info("ONNX模型加载成功，使用CUDA进行推理。")
+        except Exception as e:
+            self.get_logger().error(f"无法加载ONNX模型。请检查ONNX Runtime和CUDA/cuDNN环境。错误: {e}")
+            rclpy.shutdown()
+            return
 
-        # 获取模型的输入和输出名称及形状
+        # 获取模型的输入和输出名称
         self.input_name = self.session.get_inputs()[0].name
-        model_input = self.session.get_inputs()[0]
-        self.input_height = model_input.shape[2]
-        self.input_width = model_input.shape[3]
         self.output_names = [output.name for output in self.session.get_outputs()]
 
         # --- 订阅者/发布者/工具 ---
@@ -56,140 +61,119 @@ class YoloDetectorNode(Node):
         self.publisher_ = self.create_publisher(Detections, 'uav/vision/detections', 10)
         self.bridge = CvBridge()
         
-        self.get_logger().info("YOLO ONNX检测节点已启动，等待图像消息...")
+        self.get_logger().info("YOLO ONNX检测节点已启动并完成初始化，等待图像消息...")
 
-    def preprocess(self, img):
-        """对图像进行预处理以匹配模型输入"""
-        img_height, img_width, _ = img.shape
-        # 缩放图像并填充以保持纵横比
-        scale = min(self.input_width / img_width, self.input_height / img_height)
-        new_width, new_height = int(img_width * scale), int(img_height * scale)
-        resized_img = cv2.resize(img, (new_width, new_height))
+    def preprocess_warpAffine(self, image, dst_width, dst_height):
+        """
+        [黄金标准] 使用仿射变换进行预处理
+        """
+        scale = min((dst_width / image.shape[1], dst_height / image.shape[0]))
+        ox = (dst_width - scale * image.shape[1]) / 2
+        oy = (dst_height - scale * image.shape[0]) / 2
         
-        # 创建一个用灰色填充的画布
-        padded_img = np.full((self.input_height, self.input_width, 3), 114, dtype=np.uint8)
-        # 将缩放后的图像粘贴到画布中央
-        padded_img[(self.input_height - new_height) // 2:(self.input_height - new_height) // 2 + new_height,
-                   (self.input_width - new_width) // 2:(self.input_width - new_width) // 2 + new_width, :] = resized_img
+        M = np.array([
+            [scale, 0, ox],
+            [0, scale, oy]
+        ], dtype=np.float32)
         
-        # 转换维度 HWC -> CHW, BGR -> RGB
-        padded_img = padded_img.transpose((2, 0, 1))[::-1]
-        # 归一化到 0-1
-        padded_img = np.ascontiguousarray(padded_img, dtype=np.float32) / 255.0
-        # 增加一个batch维度
-        padded_img = np.expand_dims(padded_img, axis=0)
-        return padded_img, scale
-
-    def postprocess(self, outputs, original_shape, scale):
-        """对模型输出进行后处理 (v3 - 诊断版)"""
-        # --- 日志1: 检查原始模型输出 ---
-        self.get_logger().info(f"--- Frame Analysis Start ---")
-        self.get_logger().info(f"Model raw output shape: {outputs[0].shape}")
-
-        predictions = np.squeeze(outputs[0]).T
-
-        scores = np.max(predictions[:, 4:], axis=1)
-        conf_threshold = self.get_parameter('confidence_threshold').get_parameter_value().double_value
+        img_pre = cv2.warpAffine(image, M, (dst_width, dst_height), flags=cv2.INTER_LINEAR,
+                                 borderMode=cv2.BORDER_CONSTANT, borderValue=(114, 114, 114))
         
-        # --- 日志2: 检查置信度过滤前的检测数量 ---
-        self.get_logger().info(f"Total proposals before confidence filtering: {len(scores)}")
+        IM = cv2.invertAffineTransform(M)
 
-        # 过滤掉低于置信度阈值的预测
-        high_conf_indices = scores > conf_threshold
-        predictions = predictions[high_conf_indices, :]
-        scores = scores[high_conf_indices]
-
-        # --- 日志3: 检查置信度过滤后的检测数量 ---
-        self.get_logger().info(f"Proposals after confidence filtering (threshold={conf_threshold:.2f}): {len(scores)}")
-
-        if predictions.shape[0] == 0:
-            self.get_logger().warn("No proposals left after confidence filtering. Nothing to process.")
-            return [], [], []
-
-        class_ids = np.argmax(predictions[:, 4:], axis=1)
-        boxes_cxcywh = predictions[:, :4]
-
-        boxes_xywh = boxes_cxcywh.copy()
-        boxes_xywh[:, 0] = boxes_cxcywh[:, 0] - (boxes_cxcywh[:, 2] / 2)
-        boxes_xywh[:, 1] = boxes_cxcywh[:, 1] - (boxes_cxcywh[:, 3] / 2)
+        img_pre = (img_pre[..., ::-1] / 255.0).astype(np.float32)
+        img_pre = img_pre.transpose(2, 0, 1)[None]
         
-        iou_threshold = self.get_parameter('iou_threshold').get_parameter_value().double_value
-        
-        # --- 日志4: 检查送入NMS的数据 ---
-        self.get_logger().info(f"Data sent to NMS: {len(boxes_xywh)} boxes, {len(scores)} scores.")
+        return img_pre, IM
 
-        indices = cv2.dnn.NMSBoxes(boxes_xywh.tolist(), scores.tolist(), conf_threshold, iou_threshold)
-        
-        # --- 日志5: 检查NMS的输出结果 ---
-        self.get_logger().info(f"NMS raw output: {indices}")
+    def postprocess(self, pred, IM):
+        """
+        [黄金标准] 后处理函数
+        """
+        conf_thres = self.get_parameter('confidence_threshold').get_parameter_value().double_value
+        iou_thres = self.get_parameter('iou_threshold').get_parameter_value().double_value
 
+        boxes = []
+        proposals = pred[0]
+        
+        for item in proposals:
+            label = item[4:].argmax()
+            confidence = item[4 + label]
+            if confidence < conf_thres:
+                continue
+
+            cx, cy, w, h = item[:4]
+            left = cx - w * 0.5
+            top = cy - h * 0.5
+            right = cx + w * 0.5
+            bottom = cy + h * 0.5
+            boxes.append([left, top, right, bottom, confidence, label])
+
+        if not boxes:
+            return np.array([])
+        
+        boxes = np.array(boxes)
+        
+        lr = boxes[:, [0, 2]]
+        tb = boxes[:, [1, 3]]
+        boxes[:, [0, 2]] = IM[0][0] * lr + IM[0][2]
+        boxes[:, [1, 3]] = IM[1][1] * tb + IM[1][2]
+        
+        confidences = boxes[:, 4]
+        labels = boxes[:, 5]
+        bboxes = boxes[:, :4]
+        
+        indices = cv2.dnn.NMSBoxes(bboxes.tolist(), confidences.tolist(), conf_thres, iou_thres)
+        
         if len(indices) > 0:
             indices = indices.flatten()
-            self.get_logger().info(f"NMS result: {len(indices)} boxes left after suppression.")
+            return boxes[indices]
         else:
-            self.get_logger().warn("NMS suppressed all boxes. No detections to publish.")
-            return [], [], []
-
-        final_boxes_cxcywh = boxes_cxcywh[indices]
-        final_scores = scores[indices]
-        final_class_ids = class_ids[indices]
-        
-        # --- 日志6: 打印最终检测结果 ---
-        final_class_names = [COCO_CLASSES[i] for i in final_class_ids]
-        self.get_logger().info(f"Final Detections: {list(zip(final_class_names, final_scores))}")
-        self.get_logger().info(f"--- Frame Analysis End ---")
-
-
-        # 将坐标从模型输入尺寸转换回原始图像尺寸 (这部分代码保持不变)
-        final_boxes_cxcywh[:, 0] -= ((self.input_width - original_shape[1] * scale) / 2)
-        final_boxes_cxcywh[:, 1] -= ((self.input_height - original_shape[0] * scale) / 2)
-        final_boxes_cxcywh /= scale
-        
-        return final_boxes_cxcywh, final_scores, final_class_ids
-
+            return np.array([])
 
     def image_callback(self, msg: Image):
         cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         
         # 预处理
-        input_tensor, scale = self.preprocess(cv_image)
+        input_tensor, inverse_matrix = self.preprocess_warpAffine(cv_image, self.input_width, self.input_height)
         
         # ONNX推理
         outputs = self.session.run(self.output_names, {self.input_name: input_tensor})
         
         # 后处理
-        boxes, scores, class_ids = self.postprocess(outputs, cv_image.shape, scale)
+        # outputs[0] 形状 (1, 84, 8400), 转置为 (1, 8400, 84)
+        predictions = np.squeeze(outputs[0]).T[None, :, :]
+        final_boxes = self.postprocess(predictions, inverse_matrix)
 
         # 封装成自定义消息
         detections_msg = Detections()
-        # --- 关键修正：将接收到的图像消息头传递下去 ---
         detections_msg.header = msg.header
 
-        for box, score, class_id in zip(boxes, scores, class_ids):
+        for box in final_boxes:
+            left, top, right, bottom, confidence, label_id = box
+            
             detection = Detection()
-            detection.class_name = COCO_CLASSES[class_id]
-            detection.confidence = float(score)
+            detection.class_name = COCO_CLASSES[int(label_id)]
+            detection.confidence = float(confidence)
+            detection.bbox = [int(left), int(top), int(right), int(bottom)]
             
-            cx, cy, w, h = box
-            x1 = int(cx - w / 2)
-            y1 = int(cy - h / 2)
-            x2 = int(cx + w / 2)
-            y2 = int(cy + h / 2)
-            
-            detection.bbox = [x1, y1, x2, y2]
             detections_msg.detections.append(detection)
             
         self.publisher_.publish(detections_msg)
+        if len(final_boxes) > 0:
+            self.get_logger().info(f"成功发布了 {len(detections_msg.detections)} 个检测结果。")
 
 
 def main(args=None):
     rclpy.init(args=args)
     yolo_detector_node = YoloDetectorNode()
-    rclpy.spin(yolo_detector_node)
-    
-    # 节点关闭时销毁
-    yolo_detector_node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(yolo_detector_node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        yolo_detector_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
