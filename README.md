@@ -1,4 +1,4 @@
-# Project Chimera: 本地化无人机感知引擎 (PoC: Apollo)
+#  本地化无人机感知引擎 (PoC: Uav)
 
 [![ROS Version](https://img.shields.io/badge/ROS-Humble-blueviolet)](https://docs.ros.org/en/humble/index.html)
 [![Python Version](https://img.shields.io/badge/Python-3.10-blue)](https://www.python.org/downloads/release/python-3100/)
@@ -11,7 +11,7 @@
 
 ## 成果展示 (Final Result)
 
-![Live Detection in Rviz2](rviz2_detection_result.png)
+![Live Detection in Rviz2](assets/readme/rviz2_detection_result.png)
 > *上图为本项目在Rviz2中的实时运行效果。系统稳定地检测并跟踪视频流中的车辆，边界框和标签实时叠加在图像上。*
 
 ## 核心愿景 (Project Chimera)
